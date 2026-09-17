@@ -19,6 +19,14 @@ Usage
     python easyjet_flight_check.py --leg-set winter
     python easyjet_flight_check.py --leg-set spring
     python easyjet_flight_check.py --leg-set winter --email
+    python easyjet_flight_check.py --check 2027-03-23 --origin ABZ --destination LTN
+
+--check runs a single fast lookup for one date/route and exits, instead of
+searching a whole window of candidate days - use it to sanity-check a
+specific date quickly. Whenever any query (in --check or a leg-set search)
+comes up as anything other than a clean easyJet result, a screenshot and
+the page's text are saved under --debug-dir (default ./debug) so it's
+possible to see exactly what Google Flights returned instead of guessing.
 
 Configuration is read from a local .env file (see .env.example), or from
 real environment variables of the same names:
@@ -179,37 +187,81 @@ def accept_google_consent_if_present(page: Page) -> None:
         pass
 
 
-def search_leg(page: Page, leg: Leg) -> list[FlightOption]:
+def save_debug_snapshot(page: Page, debug_dir: Path, origin: str, destination: str, the_date: dt.date, reason: str) -> None:
+    """Save a screenshot + the page's visible text, so a non-"ok" result can be inspected later instead of guessed at."""
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        stem = f"{origin}-{destination}_{the_date.isoformat()}_{reason}_{stamp}"
+        page.screenshot(path=str(debug_dir / f"{stem}.png"), full_page=True)
+        body_text = page.locator("body").inner_text()
+        (debug_dir / f"{stem}.txt").write_text(f"url: {page.url}\nreason: {reason}\n\n{body_text}", encoding="utf-8")
+    except Exception:
+        pass  # diagnostics must never crash the search itself
+
+
+def fetch_easyjet_options(page: Page, origin: str, destination: str, the_date: dt.date, debug_dir: Path) -> tuple[list[FlightOption], str]:
+    """Query Google Flights for one origin/destination/date.
+
+    Returns (options, status), where status is one of:
+      "ok"               - one or more easyJet options were parsed
+      "no-easyjet"        - other airlines' flights loaded, but no easyJet service that day
+      "zero-parsed"       - an easyJet result appeared but nothing matched the parsing regexes (a real bug)
+      "empty-or-blocked"  - nothing resembling a flight result loaded in time (consent wall, rate limit, genuinely empty)
+    A debug snapshot is saved for every status other than "ok".
+    """
+    query = f"one way flights from {origin} to {destination} on {the_date.isoformat()}"
+    url = "https://www.google.com/travel/flights?q=" + query.replace(" ", "%20")
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    accept_google_consent_if_present(page)
+    try:
+        page.wait_for_selector(f"li:has-text('{AIRLINE}')", timeout=12000)
+    except PlaywrightTimeoutError:
+        status = "no-easyjet" if page.locator("li", has_text=FLIGHT_TIME_RE).count() > 0 else "empty-or-blocked"
+        save_debug_snapshot(page, debug_dir, origin, destination, the_date, status)
+        return [], status
+    page.wait_for_timeout(1200)
+    options = extract_easyjet_options(page, the_date)
+    if not options:
+        save_debug_snapshot(page, debug_dir, origin, destination, the_date, "zero-parsed")
+        return [], "zero-parsed"
+    return options, "ok"
+
+
+def search_leg(page: Page, leg: Leg, debug_dir: Path) -> list[FlightOption]:
     results: list[FlightOption] = []
     for the_date in search_order_dates(leg):
         if len(results) >= leg.num_options:
             break
-        query = f"one way flights from {leg.origin} to {leg.destination} on {the_date.isoformat()}"
-        url = "https://www.google.com/travel/flights?q=" + query.replace(" ", "%20")
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        accept_google_consent_if_present(page)
-        try:
-            page.wait_for_selector(f"li:has-text('{AIRLINE}')", timeout=12000)
-        except PlaywrightTimeoutError:
-            continue  # no easyJet service that day
-        page.wait_for_timeout(1200)
-        day_options = extract_easyjet_options(page, the_date)
+        day_options, status = fetch_easyjet_options(page, leg.origin, leg.destination, the_date, debug_dir)
+        print(f"  {the_date.isoformat()}: {status}" + (f" ({len(day_options)} option(s))" if day_options else ""))
         results.extend(day_options)
     results = results[: leg.num_options] if len(results) > leg.num_options else results
     results.sort(key=lambda o: (o.date, dt.datetime.strptime(o.depart_time, "%I:%M %p").time()))
     return results
 
 
-def run_search(leg_set_name: str, headless: bool = True) -> dict[str, list[FlightOption]]:
+def run_search(leg_set_name: str, headless: bool = True, debug_dir: Path = Path("debug")) -> tuple[dict[str, list[FlightOption]], list[Leg]]:
     legs = LEG_SETS[leg_set_name]
     report: dict[str, list[FlightOption]] = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         page = browser.new_page(viewport={"width": 1400, "height": 1000})
         for leg in legs:
-            report[leg.label] = search_leg(page, leg)
+            print(f"\n{leg.label}")
+            report[leg.label] = search_leg(page, leg, debug_dir)
         browser.close()
     return report, legs
+
+
+def check_date(origin: str, destination: str, the_date: dt.date, headless: bool = True, debug_dir: Path = Path("debug")) -> tuple[list[FlightOption], str]:
+    """Fast, single-date counterpart to run_search(): one page load, one route/date, no window search."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page(viewport={"width": 1400, "height": 1000})
+        options, status = fetch_easyjet_options(page, origin, destination, the_date, debug_dir)
+        browser.close()
+    return options, status
 
 
 def format_price(o: FlightOption) -> str:
@@ -285,9 +337,28 @@ def main() -> None:
     parser.add_argument("--email", action="store_true", help="Also email the report to the configured recipients (requires GMAIL_ADDRESS / GMAIL_APP_PASSWORD env vars)")
     parser.add_argument("--headed", action="store_true", help="Run the browser headed (visible) instead of headless")
     parser.add_argument("--out-dir", default="reports", help="Directory to write the HTML report into (default: ./reports)")
+    parser.add_argument("--debug-dir", default="debug", help="Directory for screenshot+text snapshots saved on any non-ok result (default: ./debug)")
+    parser.add_argument("--check", type=dt.date.fromisoformat, metavar="YYYY-MM-DD", help="Fast single-date check: query one date/route and print the result, then exit (skips the leg-set window search, HTML report, and --email)")
+    parser.add_argument("--origin", default="ABZ", help="Origin airport code, used with --check (default: ABZ)")
+    parser.add_argument("--destination", default="LTN", help="Destination airport code, used with --check (default: LTN)")
     args = parser.parse_args()
 
-    report, legs = run_search(args.leg_set, headless=not args.headed)
+    debug_dir = Path(args.debug_dir)
+
+    if args.check:
+        print(f"Checking {args.origin} -> {args.destination} on {args.check.isoformat()} ...")
+        options, status = check_date(args.origin, args.destination, args.check, headless=not args.headed, debug_dir=debug_dir)
+        if options:
+            cheapest = min(o.price_gbp for o in options)
+            print(f"YES - {len(options)} easyJet option(s) found. Cheapest: £{cheapest}")
+            for o in options:
+                print(f"  {o.depart_time} -> {o.arrive_time}  {o.duration}  {o.stops}  {format_price(o)}")
+        else:
+            print(f"NO - status: {status}")
+            print(f"  Debug snapshot saved under {debug_dir.resolve()}")
+        return
+
+    report, legs = run_search(args.leg_set, headless=not args.headed, debug_dir=debug_dir)
 
     html = build_html_report(args.leg_set, legs, report)
 
