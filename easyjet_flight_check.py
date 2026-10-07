@@ -11,6 +11,11 @@ headless and headed). This script instead reads live easyJet-operated fares
 from Google Flights, which does not block this kind of automated, low-volume,
 personal-use access. Every result is filtered to airline == "easyJet".
 
+Google Flights prices the page in the machine's local currency, so a search
+from outside the UK comes back in dollars (or another local currency) even
+for a UK route. The request pins currency to GBP. Prices are never converted:
+if the page is still not in pounds, that query is reported as wrong-currency.
+
 Term dates source: University of Aberdeen academic calendar
 https://www.abdn.ac.uk/students/academic-life/semester-dates/academic-calendar/
 
@@ -49,8 +54,14 @@ from dataclasses import dataclass, field
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+try:
+    from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+except ImportError:  # parsing is tested offline, without the browser dependency
+    Page = object  # type: ignore[misc,assignment]
+    PlaywrightTimeoutError = TimeoutError
+    sync_playwright = None
 
 AIRLINE = "easyJet"
 
@@ -70,10 +81,28 @@ load_dotenv()
 
 RECIPIENTS = [addr.strip() for addr in os.environ.get("RECIPIENTS", "").split(",") if addr.strip()]
 
-FLIGHT_TIME_RE = re.compile(r"(\d{1,2}:\d{2}\s*[AP]M)\s*[–-]\s*\n?\s*(\d{1,2}:\d{2}\s*[AP]M)")
-PRICE_RE = re.compile(r"£\s*([\d,]+)")
+# 12-hour ("8:15 AM", including Google's narrow no-break space before AM/PM)
+# or 24-hour ("08:15"). The 12-hour alternative has to be tried first so the
+# optional minutes don't swallow "8:15" and leave "AM" sitting before the dash.
+_CLOCK_12 = r"\d{1,2}:\d{2}\s*[AP]M"
+_CLOCK_24 = r"\d{1,2}:\d{2}"
+_CLOCK = rf"(?:{_CLOCK_12}|{_CLOCK_24})"
+FLIGHT_TIME_RE = re.compile(rf"({_CLOCK})\s*[–—-]\s*({_CLOCK})", re.IGNORECASE)
+# Symbols and codes actually observed, plus the other common ones Google Flights
+# substitutes when the machine is outside the UK. GBP is never converted.
+_SYMBOL_PRICE_RE = re.compile(
+    r"(?P<symbol>US\$|CA\$|A\$|NZ\$|HK\$|S\$|£|€|¥|₹|\$)\s*(?P<amount>[\d,]+)"
+)
+_CODE_PRICE_RE = re.compile(
+    r"\b(?P<code>GBP|USD|EUR|CAD|AUD|NZD)\s*(?P<amount>[\d,]+)"
+    r"|(?P<amount2>[\d,]+)\s*(?P<code2>GBP|USD|EUR|CAD|AUD|NZD)\b",
+    re.IGNORECASE,
+)
 DURATION_RE = re.compile(r"(\d+\s*hr(?:\s*\d+\s*min)?|\d+\s*min)")
-STOPS_RE = re.compile(r"(Nonstop|\d+\s*stop[s]?)")
+# "Nonstop" (en-US) and "Non-stop" (en-GB), plus "1 stop" / "2 stops".
+STOPS_RE = re.compile(r"(Non-?stop|\d+\s*stops?)", re.IGNORECASE)
+
+FLIGHTS_SEARCH_URL = "https://www.google.com/travel/flights"
 
 
 @dataclass
@@ -138,6 +167,160 @@ class FlightOption:
     price_gbp: int
 
 
+def build_flights_url(origin: str, destination: str, the_date: dt.date) -> str:
+    """Search URL that asks Google Flights for GBP, wherever this machine is.
+
+    ``curr=GBP`` is the currency. ``hl=en-GB`` and ``gl=GB`` pin language and
+    country so a non-UK IP does not override that currency. The page may still
+    render US-English or UK-English; parsing accepts both.
+    """
+    query = f"one way flights from {origin} to {destination} on {the_date.isoformat()}"
+    params = urlencode(
+        {"q": query, "curr": "GBP", "hl": "en-GB", "gl": "GB"},
+        quote_via=quote,
+    )
+    return f"{FLIGHTS_SEARCH_URL}?{params}"
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_clock(raw: str) -> str:
+    """Collapse Google's narrow spaces and uppercase any AM/PM marker."""
+    cleaned = _normalize_whitespace(raw)
+    return re.sub(r"(?i)\s*([ap]m)\b", lambda m: " " + m.group(1).upper(), cleaned)
+
+
+def parse_clock(text: str) -> dt.time:
+    """Parse a 12-hour ('8:15 AM') or 24-hour ('08:15' / '20:25') clock time.
+
+    Done by hand so a non-US locale cannot change what ``%p`` means.
+    """
+    cleaned = normalize_clock(text)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\s*([AP]M))?", cleaned)
+    if not match:
+        raise ValueError(f"unrecognized time: {text!r}")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    ampm = match.group(3)
+    if ampm:
+        if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+            raise ValueError(f"unrecognized time: {text!r}")
+        if ampm == "AM":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = hour if hour == 12 else hour + 12
+    elif not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError(f"unrecognized time: {text!r}")
+    return dt.time(hour, minute)
+
+
+def parse_flight_times(text: str) -> tuple[str, str] | None:
+    """Return normalized (depart, arrive) clocks, or None if no valid pair is present."""
+    match = FLIGHT_TIME_RE.search(text)
+    if not match:
+        return None
+    depart, arrive = normalize_clock(match.group(1)), normalize_clock(match.group(2))
+    try:
+        parse_clock(depart)
+        parse_clock(arrive)
+    except ValueError:
+        return None
+    return depart, arrive
+
+
+def parse_stops(text: str) -> str | None:
+    match = STOPS_RE.search(text)
+    return match.group(1) if match else None
+
+
+def find_prices(text: str) -> list[tuple[str, int]]:
+    """Prices mentioned in ``text`` as ``('GBP'|'OTHER', whole units)``.
+
+    Amounts are the whole units Google Flights prints. Nothing is converted.
+    """
+    found: list[tuple[str, int]] = []
+    for match in _SYMBOL_PRICE_RE.finditer(text):
+        amount = int(match.group("amount").replace(",", ""))
+        currency = "GBP" if match.group("symbol") == "£" else "OTHER"
+        found.append((currency, amount))
+    for match in _CODE_PRICE_RE.finditer(text):
+        code = (match.group("code") or match.group("code2")).upper()
+        raw = match.group("amount") or match.group("amount2")
+        amount = int(raw.replace(",", ""))
+        found.append(("GBP" if code == "GBP" else "OTHER", amount))
+    return found
+
+
+def parse_gbp_price(text: str) -> int | None:
+    """First pound amount in ``text``, or None when the fare is not in GBP."""
+    for currency, amount in find_prices(text):
+        if currency == "GBP":
+            return amount
+    return None
+
+
+def has_non_gbp_price(text: str) -> bool:
+    """True when a fare is printed only in a currency other than GBP."""
+    prices = find_prices(text)
+    return bool(prices) and all(currency != "GBP" for currency, _ in prices)
+
+
+def _is_easyjet_itinerary(text: str) -> bool:
+    return AIRLINE in text and "Select flight" not in text
+
+
+def parse_listing(text: str, the_date: dt.date) -> FlightOption | None:
+    """One easyJet card with a GBP fare. None when time or pound price is missing."""
+    if not _is_easyjet_itinerary(text):
+        return None
+    times = parse_flight_times(text)
+    price = parse_gbp_price(text)
+    if times is None or price is None:
+        return None
+    duration = DURATION_RE.search(text)
+    stops = parse_stops(text)
+    return FlightOption(
+        date=the_date,
+        depart_time=times[0],
+        arrive_time=times[1],
+        duration=duration.group(1) if duration else "?",
+        stops=stops if stops else "?",
+        price_gbp=price,
+    )
+
+
+def collect_easyjet_options(texts: list[str], the_date: dt.date) -> tuple[list[FlightOption], str]:
+    """Parse listing texts into options and a status.
+
+    Status is ``ok`` when at least one GBP easyJet fare parsed, ``wrong-currency``
+    when easyJet flights were present but every fare was in another currency,
+    and ``zero-parsed`` when easyJet text was present but neither a fare nor a
+    recognizable non-GBP price was.
+    """
+    seen: set[tuple[str, str, int]] = set()
+    options: list[FlightOption] = []
+    rejected_currency = False
+    for text in texts:
+        if not _is_easyjet_itinerary(text):
+            continue
+        option = parse_listing(text, the_date)
+        if option is None:
+            if has_non_gbp_price(text):
+                rejected_currency = True
+            continue
+        key = (option.depart_time, option.arrive_time, option.price_gbp)
+        if key in seen:
+            continue
+        seen.add(key)
+        options.append(option)
+    if options:
+        return options, "ok"
+    if rejected_currency:
+        return [], "wrong-currency"
+    return [], "zero-parsed"
+
+
 def search_order_dates(leg: Leg) -> list[dt.date]:
     """Dates to try, closest to the anchor date first."""
     offsets = range(1, leg.window_days + 1)
@@ -145,39 +328,16 @@ def search_order_dates(leg: Leg) -> list[dt.date]:
     return [leg.anchor_date + dt.timedelta(days=sign * d) for d in offsets]
 
 
-def extract_easyjet_options(page: Page, the_date: dt.date) -> list[FlightOption]:
+def extract_easyjet_options(page: Page, the_date: dt.date) -> tuple[list[FlightOption], str]:
     lis = page.locator("li")
     count = lis.count()
-    seen: set[tuple[str, str, str]] = set()
-    options: list[FlightOption] = []
+    texts: list[str] = []
     for i in range(count):
         try:
-            text = lis.nth(i).inner_text()
+            texts.append(lis.nth(i).inner_text())
         except Exception:
             continue
-        if AIRLINE not in text or "Select flight" in text:
-            continue
-        m_time = FLIGHT_TIME_RE.search(text)
-        m_price = PRICE_RE.search(text)
-        if not (m_time and m_price):
-            continue
-        key = (m_time.group(1), m_time.group(2), m_price.group(1))
-        if key in seen:
-            continue
-        seen.add(key)
-        m_dur = DURATION_RE.search(text)
-        m_stops = STOPS_RE.search(text)
-        options.append(
-            FlightOption(
-                date=the_date,
-                depart_time=m_time.group(1),
-                arrive_time=m_time.group(2),
-                duration=m_dur.group(1) if m_dur else "?",
-                stops=m_stops.group(1) if m_stops else "?",
-                price_gbp=int(m_price.group(1).replace(",", "")),
-            )
-        )
-    return options
+    return collect_easyjet_options(texts, the_date)
 
 
 def accept_google_consent_if_present(page: Page) -> None:
@@ -204,14 +364,14 @@ def fetch_easyjet_options(page: Page, origin: str, destination: str, the_date: d
     """Query Google Flights for one origin/destination/date.
 
     Returns (options, status), where status is one of:
-      "ok"               - one or more easyJet options were parsed
+      "ok"               - one or more easyJet options were parsed, priced in GBP
       "no-easyjet"        - other airlines' flights loaded, but no easyJet service that day
+      "wrong-currency"    - easyJet flights were listed, but not in GBP (prices are not converted)
       "zero-parsed"       - an easyJet result appeared but nothing matched the parsing regexes (a real bug)
       "empty-or-blocked"  - nothing resembling a flight result loaded in time (consent wall, rate limit, genuinely empty)
     A debug snapshot is saved for every status other than "ok".
     """
-    query = f"one way flights from {origin} to {destination} on {the_date.isoformat()}"
-    url = "https://www.google.com/travel/flights?q=" + query.replace(" ", "%20")
+    url = build_flights_url(origin, destination, the_date)
     page.goto(url, wait_until="domcontentloaded", timeout=45000)
     accept_google_consent_if_present(page)
     try:
@@ -221,10 +381,10 @@ def fetch_easyjet_options(page: Page, origin: str, destination: str, the_date: d
         save_debug_snapshot(page, debug_dir, origin, destination, the_date, status)
         return [], status
     page.wait_for_timeout(1200)
-    options = extract_easyjet_options(page, the_date)
-    if not options:
-        save_debug_snapshot(page, debug_dir, origin, destination, the_date, "zero-parsed")
-        return [], "zero-parsed"
+    options, parse_status = extract_easyjet_options(page, the_date)
+    if parse_status != "ok":
+        save_debug_snapshot(page, debug_dir, origin, destination, the_date, parse_status)
+        return [], parse_status
     return options, "ok"
 
 
@@ -237,16 +397,31 @@ def search_leg(page: Page, leg: Leg, debug_dir: Path) -> list[FlightOption]:
         print(f"  {the_date.isoformat()}: {status}" + (f" ({len(day_options)} option(s))" if day_options else ""))
         results.extend(day_options)
     results = results[: leg.num_options] if len(results) > leg.num_options else results
-    results.sort(key=lambda o: (o.date, dt.datetime.strptime(o.depart_time, "%I:%M %p").time()))
+    results.sort(key=lambda o: (o.date, parse_clock(o.depart_time)))
     return results
 
 
+def _require_playwright() -> None:
+    if sync_playwright is None:
+        raise RuntimeError(
+            "playwright is required to query Google Flights. "
+            "Install it and run `playwright install chromium`."
+        )
+
+
+def _open_search_page(browser):
+    """A page whose language is en-GB, so Accept-Language agrees with the search URL."""
+    context = browser.new_context(viewport={"width": 1400, "height": 1000}, locale="en-GB")
+    return context.new_page()
+
+
 def run_search(leg_set_name: str, headless: bool = True, debug_dir: Path = Path("debug")) -> tuple[dict[str, list[FlightOption]], list[Leg]]:
+    _require_playwright()
     legs = LEG_SETS[leg_set_name]
     report: dict[str, list[FlightOption]] = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(viewport={"width": 1400, "height": 1000})
+        page = _open_search_page(browser)
         for leg in legs:
             print(f"\n{leg.label}")
             report[leg.label] = search_leg(page, leg, debug_dir)
@@ -256,9 +431,10 @@ def run_search(leg_set_name: str, headless: bool = True, debug_dir: Path = Path(
 
 def check_date(origin: str, destination: str, the_date: dt.date, headless: bool = True, debug_dir: Path = Path("debug")) -> tuple[list[FlightOption], str]:
     """Fast, single-date counterpart to run_search(): one page load, one route/date, no window search."""
+    _require_playwright()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(viewport={"width": 1400, "height": 1000})
+        page = _open_search_page(browser)
         options, status = fetch_easyjet_options(page, origin, destination, the_date, debug_dir)
         browser.close()
     return options, status
